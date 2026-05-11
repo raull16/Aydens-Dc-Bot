@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from discord import Webhook, AsyncWebhookAdapter
+from discord import Webhook
 import aiohttp
 import json
 import os
@@ -21,11 +21,18 @@ WEBHOOK_URLS = {}  # Store user webhooks
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
+# Create scripts directory if it doesn't exist
+if not os.path.exists('scripts'):
+    os.makedirs('scripts')
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
-    await bot.tree.sync()
-    print("Commands synced!")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
 
 # /connect command
 @bot.tree.command(name="connect", description="Creates a private channel and webhook for you")
@@ -62,7 +69,6 @@ async def connect(interaction: discord.Interaction):
         
         await interaction.followup.send(embed=embed, ephemeral=True)
         
-        # Log to mod channel (optional)
         print(f"Created webhook for {member.name} in {channel.name}")
         
     except Exception as e:
@@ -77,6 +83,11 @@ async def source(interaction: discord.Interaction, file: discord.Attachment):
         # Check if user has webhook
         if str(interaction.user.id) not in WEBHOOK_URLS:
             await interaction.followup.send("❌ You need to run `/connect` first!", ephemeral=True)
+            return
+        
+        # Check file type
+        if not file.filename.endswith(('.lua', '.txt', '.luau')):
+            await interaction.followup.send("❌ Please upload a .lua or .txt file!", ephemeral=True)
             return
         
         # Save file
@@ -106,8 +117,13 @@ async def makesrc(interaction: discord.Interaction):
         webhook_url = WEBHOOK_URLS[str(interaction.user.id)]
         source_file = WEBHOOK_URLS[source_key]
         
+        # Check if source file exists
+        if not os.path.exists(source_file):
+            await interaction.followup.send("❌ Source file not found! Please upload again with `/source`", ephemeral=True)
+            return
+        
         # Read original script
-        async with aiofiles.open(source_file, 'r') as f:
+        async with aiofiles.open(source_file, 'r', encoding='utf-8') as f:
             original_script = await f.read()
         
         # Generate Lua script with webhook
@@ -141,15 +157,16 @@ end
         
         # Save generated script
         output_file = f"scripts/{interaction.user.id}_output.lua"
-        async with aiofiles.open(output_file, 'w') as f:
+        async with aiofiles.open(output_file, 'w', encoding='utf-8') as f:
             await f.write(lua_script)
         
         # Send the Lua file
         await interaction.followup.send(file=discord.File(output_file), ephemeral=True)
         
-        # Cleanup
+        # Cleanup after sending
         await asyncio.sleep(5)
-        os.remove(output_file)
+        if os.path.exists(output_file):
+            os.remove(output_file)
         
     except Exception as e:
         await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
@@ -159,8 +176,8 @@ end
 async def ai(interaction: discord.Interaction, prompt: str):
     await interaction.response.defer(ephemeral=True)
     
-    if not DEEPSEEK_API_KEY:
-        await interaction.followup.send("❌ AI API key not configured!", ephemeral=True)
+    if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
+        await interaction.followup.send("❌ AI API key not configured! Please set DEEPSEEK_API_KEY in Railway variables.", ephemeral=True)
         return
     
     try:
@@ -172,7 +189,7 @@ async def ai(interaction: discord.Interaction, prompt: str):
         data = {
             "model": "deepseek-chat",
             "messages": [
-                {"role": "system", "content": "You are a Lua scripting expert for Roblox. Generate clean, efficient Lua code."},
+                {"role": "system", "content": "You are a Lua scripting expert for Roblox. Generate clean, efficient Lua code. Only output the code, no explanations unless asked."},
                 {"role": "user", "content": f"Generate Lua code for: {prompt}"}
             ],
             "temperature": 0.7
@@ -184,13 +201,18 @@ async def ai(interaction: discord.Interaction, prompt: str):
                     result = await resp.json()
                     lua_code = result['choices'][0]['message']['content']
                     
+                    # Clean up code if needed
+                    lua_code = lua_code.replace('```lua', '').replace('```', '').strip()
+                    
                     # Save to file if long
                     if len(lua_code) > 1900:
                         filename = f"scripts/ai_output_{interaction.user.id}.lua"
-                        async with aiofiles.open(filename, 'w') as f:
+                        async with aiofiles.open(filename, 'w', encoding='utf-8') as f:
                             await f.write(lua_code)
                         await interaction.followup.send(file=discord.File(filename), ephemeral=True)
-                        os.remove(filename)
+                        await asyncio.sleep(5)
+                        if os.path.exists(filename):
+                            os.remove(filename)
                     else:
                         embed = discord.Embed(
                             title="🤖 AI Generated Lua Code",
@@ -199,11 +221,16 @@ async def ai(interaction: discord.Interaction, prompt: str):
                         )
                         await interaction.followup.send(embed=embed, ephemeral=True)
                 else:
-                    await interaction.followup.send(f"❌ AI Error: {resp.status}", ephemeral=True)
+                    error_text = await resp.text()
+                    await interaction.followup.send(f"❌ AI Error {resp.status}: {error_text[:200]}", ephemeral=True)
                     
     except Exception as e:
         await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
 
 # Run bot
 if __name__ == "__main__":
-    bot.run(os.getenv('DISCORD_BOT_TOKEN'))
+    token = os.getenv('DISCORD_BOT_TOKEN')
+    if not token:
+        print("ERROR: DISCORD_BOT_TOKEN not found in environment variables!")
+        exit(1)
+    bot.run(token)
