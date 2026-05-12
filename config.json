@@ -1,5 +1,5 @@
 {
-    "bot_name": "Script Connector Bot",
-    "version": "1.0.0",
-    "prefix": "/"
+    "prefix": "/",
+    "tiktok_live_channel": null,
+    "tiktok_username": null
 }
