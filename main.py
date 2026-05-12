@@ -5,179 +5,277 @@ import re
 import aiohttp
 import json
 import os
-from urllib.parse import urlparse
+import base64
+import urllib.parse
+from typing import List, Set, Dict
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Load config
 with open('config.json', 'r') as f:
     config = json.load(f)
 
-# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=config['prefix'], intents=intents)
 
-# Patterns to detect various URLs and sensitive info
+# Comprehensive patterns for obfuscated and non-obfuscated scripts
 PATTERNS = {
-    'WebSocket': r'ws://[^\s"\']+|wss://[^\s"\']+',
-    'HTTP/HTTPS URL': r'https?://[^\s"\']+',
-    'Raw GitHub URL': r'https?://raw\.githubusercontent\.com/[^\s"\']+',
-    'GitHub URL': r'https?://github\.com/[^\s"\']+',
-    'Replit URL': r'https?://replit\.com/[^\s"\']+|https?://[^\s"\']+\.repl\.co',
-    'Pastebin URL': r'https?://pastebin\.com/[^\s"\']+',
-    'Discord Webhook': r'https?://discord\.com/api/webhooks/[^\s"\']+|https?://discordapp\.com/api/webhooks/[^\s"\']+',
-    'Luarmor URL': r'https?://luarmor\.xyz/[^\s"\']+',
-    'IP Address': r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b',
-    'API Key': r'api[_-]?key["\s:=]+[A-Za-z0-9_-]+|apikey["\s:=]+[A-Za-z0-9_-]+',
-    'Token': r'token["\s:=]+[A-Za-z0-9_-]+',
-    'Webhook': r'webhook["\s:=]+[A-Za-z0-9_-]+',
-    'Loadstring URL': r'loadstring\(game:HttpGet\(["\']([^"\']+)["\']\)\)',
-    'Raw Script URL': r'game:HttpGet\(["\']([^"\']+)["\']\)',
+    'WebSockets (ws/wss)': [
+        r'ws://[^\s"\'<>(){}\[\]]+',
+        r'wss://[^\s"\'<>(){}\[\]]+',
+        r'WebSocket\(["\']([^"\']+)["\']\)',
+        r'new\s+WebSocket\(["\']([^"\']+)["\']\)',
+        r'connect\(["\']wss?://[^"\']+["\']',
+        r'"wss?://[^"]+"',
+        r"'wss?://[^']+'",
+    ],
+    'HTTP/HTTPS URLs': [
+        r'https?://[^\s"\'<>(){}\[\]]+',
+        r'game:HttpGet\(["\']([^"\']+)["\']\)',
+        r'HttpGetAsync\(["\']([^"\']+)["\']\)',
+        r'HttpGet\(["\']([^"\']+)["\']\)',
+        r'HttpPost\(["\']([^"\']+)["\']',
+        r'syn\.request\({[^}]*Url\s*=\s*["\']([^"\']+)["\']',
+        r'request\({[^}]*url\s*=\s*["\']([^"\']+)["\']',
+    ],
+    'Discord Webhooks': [
+        r'https?://discord(?:app)?\.com/api/webhooks/\d+/[a-zA-Z0-9_-]+',
+        r'webhook(?:\.discord)?\.com/api/webhooks/\d+/[a-zA-Z0-9_-]+',
+        r'"webhook":\s*"([^"]+)"',
+        r"'webhook':\s*'([^']+)'",
+    ],
+    'IP Addresses': [
+        r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d{1,5})?\b',
+    ],
+    'API Keys': [
+        r'api[_-]?key["\s:]+[A-Za-z0-9_\-]{10,}',
+        r'apikey["\s:]+[A-Za-z0-9_\-]{10,}',
+        r'["\']api_key["\']\s*:\s*["\'][A-Za-z0-9_\-]+["\']',
+        r'["\']key["\']\s*:\s*["\'][A-Za-z0-9_\-]{20,}["\']',
+    ],
+    'Tokens': [
+        r'token["\s:]+[A-Za-z0-9_\-]{20,}',
+        r'["\']token["\']\s*:\s*["\'][A-Za-z0-9_\-]{20,}["\']',
+        r'bearer\s+[A-Za-z0-9_\-\.]+',
+        r'Bot\s+[A-Za-z0-9_\-\.]{20,}',
+    ],
+    'Loadstring URLs': [
+        r'loadstring\(game:HttpGet\(["\']([^"\']+)["\']\)\)',
+        r'loadstring\(([^)]+)\)',
+    ],
+    'Hidden/Encoded URLs': [
+        r'string\.char\([^)]+\)',  # string.char obfuscation
+        r'\.\.\s*["\'][^"\']+["\']',  # String concatenation
+        r'base64\.decode\(["\']([^"\']+)["\']\)',
+        r'HttpService:Base64Decode\(["\']([^"\']+)["\']\)',
+    ],
+    'Luarmor/Obfuscation Services': [
+        r'luarmor\.xyz/[^\s"\']+',
+        r'raw\.githubusercontent\.com/[^\s"\']+',
+        r'pastebin\.com/[^\s"\']+',
+        r'github\.com/[^\s"\']+/blob/[^\s"\']+',
+    ],
 }
 
-class HTTPSpyBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix=config['prefix'], intents=intents)
-    
-    async def setup_hook(self):
-        await self.tree.sync()
-        print(f"Synced commands for {self.user}")
-
-bot = HTTPSpyBot()
-
-async def fetch_script_content(url):
-    """Fetch content from a URL"""
+async def fetch_script_content(url: str) -> str:
+    """Fetch content from a URL with proper headers"""
     try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
+            async with session.get(url, timeout=15, headers=headers) as response:
                 if response.status == 200:
                     return await response.text()
-                else:
-                    return None
+                return None
     except Exception as e:
         return None
 
-def extract_urls_from_loadstring(script):
-    """Extract URLs from loadstring and similar patterns"""
-    urls = []
+def decode_string_char(content: str) -> str:
+    """Decode string.char obfuscation"""
+    # Match patterns like string.char(104,101,108,108,111)
+    char_pattern = r'string\.char\(([^)]+)\)'
+    matches = re.findall(char_pattern, content)
     
-    # Pattern for loadstring(game:HttpGet("URL"))
-    loadstring_pattern = r'loadstring\(game:HttpGet\(["\']([^"\']+)["\']\)\)'
-    matches = re.findall(loadstring_pattern, script)
-    urls.extend(matches)
-    
-    # Pattern for game:HttpGet("URL")
-    httpget_pattern = r'game:HttpGet\(["\']([^"\']+)["\']\)'
-    matches = re.findall(httpget_pattern, script)
-    urls.extend(matches)
-    
-    # Pattern for syn.request({Url = "URL"})
-    syn_request_pattern = r'Url\s*=\s*["\']([^"\']+)["\']'
-    matches = re.findall(syn_request_pattern, script)
-    urls.extend(matches)
-    
-    return list(set(urls))
+    for match in matches:
+        try:
+            numbers = [int(x.strip()) for x in match.split(',') if x.strip().isdigit()]
+            if numbers:
+                decoded = ''.join(chr(n) for n in numbers)
+                content = content.replace(f'string.char({match})', f'"{decoded}"')
+        except:
+            pass
+    return content
 
-def analyze_script(content):
-    """Analyze script for URLs and sensitive information"""
+def decode_base64(content: str) -> str:
+    """Decode base64 encoded strings"""
+    b64_pattern = r'(?:HttpService:Base64Decode|base64\.decode)\(["\']([^"\']+)["\']\)'
+    matches = re.findall(b64_pattern, content)
+    
+    for match in matches:
+        try:
+            decoded = base64.b64decode(match).decode('utf-8', errors='ignore')
+            content = content.replace(match, decoded)
+        except:
+            pass
+    return content
+
+def deobfuscate_string(content: str) -> str:
+    """Attempt to deobfuscate common patterns"""
+    # Remove extra whitespace and newlines
+    content = ' '.join(content.split())
+    
+    # Decode string.char
+    content = decode_string_char(content)
+    
+    # Decode base64
+    content = decode_base64(content)
+    
+    # Look for concatenated strings
+    concat_pattern = r'(["\'])([^"\']+)\1\s*\.\.\s*(["\'])([^"\']+)\3'
+    content = re.sub(concat_pattern, lambda m: f'"{m.group(2)}{m.group(4)}"', content)
+    
+    return content
+
+def extract_all_urls(text: str) -> Dict[str, List[str]]:
+    """Extract all URLs and sensitive info from text"""
     findings = {}
+    text = deobfuscate_string(text)
     
-    for category, pattern in PATTERNS.items():
-        matches = re.findall(pattern, content, re.IGNORECASE)
-        if matches:
-            # Clean up matches (remove duplicates)
-            unique_matches = list(set(matches))
-            findings[category] = unique_matches
-    
-    # Special extraction for nested loadstrings
-    nested_urls = extract_urls_from_loadstring(content)
-    if nested_urls:
-        findings['Extracted Loadstring URLs'] = nested_urls
+    for category, patterns in PATTERNS.items():
+        all_matches = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
+            for match in matches:
+                if isinstance(match, tuple):
+                    for m in match:
+                        if m and len(m) > 5:
+                            all_matches.add(str(m).strip())
+                elif match and len(str(match)) > 5:
+                    all_matches.add(str(match).strip())
+        
+        if all_matches:
+            findings[category] = list(all_matches)
     
     return findings
 
-@bot.tree.command(name="httpspy", description="Analyze a script for URLs, webhooks, API keys, and sensitive information")
+async def deep_analyze(script: str, depth: int = 0, max_depth: int = 3, visited: set = None) -> Dict:
+    """Recursively analyze scripts and fetch nested loadstrings"""
+    if visited is None:
+        visited = set()
+    
+    results = {}
+    
+    # Extract loadstring URLs
+    loadstring_pattern = r'loadstring\(game:HttpGet\(["\']([^"\']+)["\']\)\)'
+    loadstring_urls = re.findall(loadstring_pattern, script)
+    
+    # Also look for hidden loadstrings
+    hidden_pattern = r'HttpGet\(["\']([^"\']+)["\']\)'
+    urls = re.findall(hidden_pattern, script)
+    loadstring_urls.extend(urls)
+    
+    # Analyze current script
+    current_findings = extract_all_urls(script)
+    if current_findings:
+        results['current_script'] = current_findings
+    
+    # Fetch and analyze nested scripts
+    if depth < max_depth:
+        for url in set(loadstring_urls):
+            if url not in visited and url.startswith('http'):
+                visited.add(url)
+                fetched = await fetch_script_content(url)
+                if fetched:
+                    nested_results = await deep_analyze(fetched, depth + 1, max_depth, visited)
+                    if nested_results:
+                        results[f'nested_script_{depth}_{url[:50]}'] = nested_results
+    
+    return results
+
+@bot.tree.command(name="httpspy", description="Deep analyze scripts for websockets, webhooks, APIs, and more")
 async def httpspy(interaction: discord.Interaction, script: str):
-    """Main command to spy on HTTP requests and extract URLs from scripts"""
+    """Main command to spy on scripts and extract everything"""
     
     await interaction.response.defer(thinking=True)
     
-    # Check if it's a loadstring or direct script
-    findings = {}
-    raw_content = script
-    
-    # Extract URLs from the provided script
-    extracted_urls = extract_urls_from_loadstring(script)
-    
-    # If there are URLs in loadstring, fetch and analyze them
-    if extracted_urls:
-        for url in extracted_urls:
-            # Fetch the content from the URL
-            fetched_content = await fetch_script_content(url)
-            if fetched_content:
-                # Analyze the fetched content
-                url_findings = analyze_script(fetched_content)
-                findings[f"Content from: {url}"] = url_findings
-                
-                # Also analyze the raw script
-                raw_findings = analyze_script(script)
-                findings["Original Script Analysis"] = raw_findings
-            else:
-                findings[f"Failed to fetch: {url}"] = {"Error": "Could not fetch content from this URL"}
-    else:
-        # Just analyze the provided script directly
-        findings = analyze_script(script)
-    
-    # Prepare response embed
-    if not findings or all(len(v) == 0 for v in findings.values() if isinstance(v, dict)):
+    # Start deep analysis
+    try:
+        analysis_results = await deep_analyze(script, max_depth=3)
+        
+        # Also check for direct websocket connections in the input
+        direct_websockets = re.findall(r'wss?://[^\s"\'<>(){}\[\]]+', script, re.IGNORECASE)
+        
+        # Prepare response
         embed = discord.Embed(
-            title="🔍 HTTP Spy Results",
-            description="No URLs, webhooks, API keys, or sensitive information found in the script.",
-            color=discord.Color.orange()
+            title="🔍 HTTP/WebSocket Spy Results",
+            color=discord.Color.green()
         )
-        await interaction.followup.send(embed=embed)
-        return
-    
-    # Create embed with findings
-    embed = discord.Embed(
-        title="🔍 HTTP Spy Results",
-        description=f"Found {sum(len(v) for v in findings.values() if isinstance(v, dict))} potential items",
-        color=discord.Color.green()
-    )
-    
-    for source, data in findings.items():
-        if isinstance(data, dict) and data:
-            for category, items in data.items():
+        
+        total_items = 0
+        has_websockets = False
+        
+        for source, findings in analysis_results.items():
+            for category, items in findings.items():
                 if items:
-                    # Truncate long URLs
-                    items_text = '\n'.join([item[:100] + '...' if len(item) > 100 else item for item in items[:5]])
-                    if len(items) > 5:
-                        items_text += f"\n*... and {len(items) - 5} more*"
+                    total_items += len(items)
+                    
+                    # Highlight websockets
+                    if 'WebSocket' in category or 'wss://' in str(items) or 'ws://' in str(items):
+                        has_websockets = True
+                        category = f"🟢 **{category}**"
+                    
+                    # Truncate long items
+                    display_items = []
+                    for item in items[:10]:  # Show first 10
+                        if len(str(item)) > 150:
+                            display_items.append(str(item)[:150] + "...")
+                        else:
+                            display_items.append(str(item))
+                    
+                    items_text = '```\n' + '\n'.join(display_items) + '\n```'
+                    if len(items) > 10:
+                        items_text += f"\n*... and {len(items) - 10} more*"
                     
                     embed.add_field(
                         name=f"📌 {category} ({len(items)})",
-                        value=f"```{items_text}```",
+                        value=items_text,
                         inline=False
                     )
-        elif isinstance(data, list) and data:
-            items_text = '\n'.join([item[:100] + '...' if len(item) > 100 else item for item in data[:5]])
-            if len(data) > 5:
-                items_text += f"\n*... and {len(data) - 5} more*"
+        
+        # Add direct websocket findings
+        if direct_websockets:
+            has_websockets = True
             embed.add_field(
-                name=f"📌 {source}",
-                value=f"```{items_text}```",
+                name="🟢 **DIRECT WEBSOCKET DETECTED**",
+                value=f"```\n{chr(10).join(direct_websockets[:5])}\n```",
                 inline=False
             )
-    
-    # Add warning about potentially malicious content
-    embed.set_footer(text="⚠️ Always verify URLs before executing unknown scripts!")
-    
-    await interaction.followup.send(embed=embed)
+            total_items += len(direct_websockets)
+        
+        if total_items == 0:
+            embed.description = "No URLs, websockets, or sensitive information found in the script."
+            embed.color = discord.Color.orange()
+        else:
+            embed.description = f"**Found {total_items} potential connections/URLs**"
+            if has_websockets:
+                embed.description += "\n⚠️ **WEBSOCKET CONNECTIONS DETECTED** ⚠️"
+            
+        embed.set_footer(text="⚠️ These URLs/websockets were extracted from the script. Always verify before executing!")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        error_embed = discord.Embed(
+            title="❌ Error",
+            description=f"Failed to analyze script: {str(e)}",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=error_embed)
 
-# Simple ping command to check if bot is alive
 @bot.tree.command(name="ping", description="Check bot latency")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! {round(bot.latency * 1000)}ms", ephemeral=True)
@@ -186,7 +284,13 @@ async def ping(interaction: discord.Interaction):
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     print(f'Bot is in {len(bot.guilds)} guilds')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for scripts | /httpspy"))
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for websockets | /httpspy"))
+    
+    # Sync commands
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
 
-# Run bot
 bot.run(os.getenv('DISCORD_TOKEN'))
