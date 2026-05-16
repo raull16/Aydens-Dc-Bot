@@ -4,9 +4,11 @@ from discord import app_commands
 import websockets
 import asyncio
 import json
-import aiohttp
-from typing import Optional, Dict
-import config
+from typing import Dict, Optional
+import os
+
+# Disable voice to avoid audioop issues
+discord.voice_client.VoiceClient = None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -33,6 +35,7 @@ class LogManager:
         self.websocket = None
         self.websocket_task = None
         self.is_running = False
+        self.current_websocket_uri = None
 
     async def create_webhooks(self, guild: discord.Guild):
         """Create webhooks in all three channels"""
@@ -41,7 +44,11 @@ class LogManager:
                 channel = guild.get_channel(channel_id)
                 if channel:
                     try:
-                        webhook = await channel.create_webhook(name=f"LogBot-{key}")
+                        # Check if webhook already exists
+                        existing_webhooks = await channel.webhooks()
+                        webhook = next((w for w in existing_webhooks if w.name == f"LogBot-{key}"), None)
+                        if not webhook:
+                            webhook = await channel.create_webhook(name=f"LogBot-{key}")
                         self.webhooks[key] = webhook
                     except discord.Forbidden:
                         print(f"No permission to create webhook in {channel.name}")
@@ -53,6 +60,9 @@ class LogManager:
         webhook = self.webhooks.get(key)
         if webhook:
             try:
+                # Truncate message if too long (Discord limit is 2000)
+                if len(message) > 1900:
+                    message = message[:1900] + "..."
                 await webhook.send(message)
             except Exception as e:
                 print(f"Error sending log: {e}")
@@ -65,30 +75,43 @@ class LogManager:
     async def websocket_handler(self, uri: str):
         """Handle WebSocket connection and receive logs"""
         try:
-            async with websockets.connect(uri) as websocket:
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=60) as websocket:
                 self.websocket = websocket
-                await self.send_to_all(f"✅ Connected to WebSocket: {uri}")
+                await self.send_to_all(f"✅ Connected to WebSocket: `{uri}`")
                 
                 while self.is_running:
                     try:
-                        message = await websocket.recv()
-                        # Format the log message
-                        log_text = f"📝 **Log Received:**\n```\n{message}\n```"
+                        message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                        
+                        # Try to parse as JSON for better formatting
+                        try:
+                            data = json.loads(message)
+                            log_text = f"📝 **Log Received:**\n```json\n{json.dumps(data, indent=2)[:1500]}\n```"
+                        except:
+                            log_text = f"📝 **Log Received:**\n```\n{message[:1500]}\n```"
+                        
                         await self.send_to_all(log_text)
-                    except websockets.exceptions.ConnectionClosed:
-                        await self.send_to_all("⚠️ WebSocket connection closed")
+                    except asyncio.TimeoutError:
+                        # Keep connection alive
+                        continue
+                    except websockets.exceptions.ConnectionClosed as e:
+                        await self.send_to_all(f"⚠️ WebSocket connection closed: {e}")
                         break
                     except Exception as e:
-                        await self.send_to_all(f"❌ Error receiving log: {str(e)}")
+                        await self.send_to_all(f"❌ Error receiving log: {str(e)[:500]}")
                         break
         except Exception as e:
-            await self.send_to_all(f"❌ Failed to connect to WebSocket: {str(e)}")
+            await self.send_to_all(f"❌ Failed to connect to WebSocket: {str(e)[:500]}")
+        finally:
+            self.is_running = False
+            self.websocket = None
 
     async def start_logging(self, uri: str):
         """Start the logging process"""
         if self.is_running:
             return False
         
+        self.current_websocket_uri = uri
         self.is_running = True
         self.websocket_task = asyncio.create_task(self.websocket_handler(uri))
         return True
@@ -102,14 +125,17 @@ class LogManager:
                 await self.websocket_task
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                print(f"Error stopping websocket task: {e}")
         if self.websocket:
             await self.websocket.close()
-        await self.send_to_all("🛑 Logging stopped")
+        await self.send_to_all("🛑 **Logging stopped**")
         return True
 
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
+    print(f'Bot is in {len(bot.guilds)} guild(s)')
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} command(s)")
@@ -158,7 +184,7 @@ async def setchannel(interaction: discord.Interaction, ch1: discord.TextChannel,
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="connect", description="Connect to a WebSocket and start receiving logs")
-@app_commands.describe(websocket="The WebSocket URL to connect to")
+@app_commands.describe(websocket="The WebSocket URL to connect to (ws:// or wss://)")
 async def connect(interaction: discord.Interaction, websocket: str):
     if not interaction.guild:
         await interaction.response.send_message("This command must be used in a server!", ephemeral=True)
@@ -169,23 +195,23 @@ async def connect(interaction: discord.Interaction, websocket: str):
         return
     
     if interaction.guild_id not in guild_data:
-        await interaction.response.send_message("Please use /setchannel first to configure channels!", ephemeral=True)
+        await interaction.response.send_message("Please use `/setchannel` first to configure channels!", ephemeral=True)
         return
     
     manager = guild_data[interaction.guild_id]
     
     # Check if webhooks exist
     if not any(manager.webhooks.values()):
-        await interaction.response.send_message("Webhooks not found. Please reconfigure channels with /setchannel!", ephemeral=True)
+        await interaction.response.send_message("Webhooks not found. Please reconfigure channels with `/setchannel`!", ephemeral=True)
         return
     
-    await interaction.response.send_message(f"🔄 Connecting to WebSocket: {websocket}...", ephemeral=True)
+    await interaction.response.send_message(f"🔄 Connecting to WebSocket: `{websocket}`...", ephemeral=True)
     
     success = await manager.start_logging(websocket)
     if success:
-        await interaction.followup.send(f"✅ Started logging from WebSocket: {websocket}")
+        await interaction.followup.send(f"✅ Started logging from WebSocket: `{websocket}`")
     else:
-        await interaction.followup.send("❌ Already logging! Use /stop first if you want to restart.")
+        await interaction.followup.send("❌ Already logging! Use `/stop` first if you want to restart.")
 
 @bot.tree.command(name="stop", description="Stop all logging activities")
 async def stop(interaction: discord.Interaction):
@@ -207,7 +233,7 @@ async def stop(interaction: discord.Interaction):
         await interaction.response.send_message("No active logging session to stop!", ephemeral=True)
         return
     
-    await interaction.response.send_message("🛑 Stopping logging...")
+    await interaction.response.send_message("🛑 Stopping logging...", ephemeral=True)
     await manager.stop_logging()
     await interaction.followup.send("✅ Logging stopped successfully!")
 
@@ -222,26 +248,79 @@ async def start(interaction: discord.Interaction):
         return
     
     if interaction.guild_id not in guild_data:
-        await interaction.response.send_message("No configuration found! Please use /setchannel first.", ephemeral=True)
+        await interaction.response.send_message("No configuration found! Please use `/setchannel` first.", ephemeral=True)
         return
     
     manager = guild_data[interaction.guild_id]
     
-    if not manager.websocket:
-        await interaction.response.send_message("No WebSocket connection was established before. Please use /connect first.", ephemeral=True)
+    if not manager.current_websocket_uri:
+        await interaction.response.send_message("No WebSocket connection was established before. Please use `/connect` first.", ephemeral=True)
         return
     
     if manager.is_running:
         await interaction.response.send_message("Logging is already running!", ephemeral=True)
         return
     
-    await interaction.response.send_message("🔄 Restarting logging...")
-    # You'll need to store the last WebSocket URI to reconnect
-    # For now, this just shows the concept
-    await interaction.followup.send("⚠️ Please use /connect again with the WebSocket URI to restart logging.")
+    await interaction.response.send_message(f"🔄 Restarting logging to `{manager.current_websocket_uri}`...", ephemeral=True)
+    success = await manager.start_logging(manager.current_websocket_uri)
+    if success:
+        await interaction.followup.send(f"✅ Logging restarted successfully!")
+    else:
+        await interaction.followup.send("❌ Failed to restart logging!")
+
+@bot.tree.command(name="status", description="Check the current logging status")
+async def status(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used in a server!", ephemeral=True)
+        return
+    
+    if interaction.guild_id not in guild_data:
+        await interaction.response.send_message("No configuration found! Use `/setchannel` to set up channels.", ephemeral=True)
+        return
+    
+    manager = guild_data[interaction.guild_id]
+    
+    embed = discord.Embed(title="📊 Logging Status", color=discord.Color.blue())
+    
+    # Check channels
+    channels_configured = []
+    for key, channel_id in manager.channels.items():
+        if channel_id:
+            channel = interaction.guild.get_channel(channel_id)
+            if channel:
+                channels_configured.append(f"✅ {key}: {channel.mention}")
+            else:
+                channels_configured.append(f"❌ {key}: Deleted channel")
+        else:
+            channels_configured.append(f"❌ {key}: Not set")
+    
+    embed.add_field(name="Channels", value="\n".join(channels_configured), inline=False)
+    
+    # Check webhooks
+    webhooks_status = []
+    for key, webhook in manager.webhooks.items():
+        if webhook:
+            webhooks_status.append(f"✅ {key}: Created")
+        else:
+            webhooks_status.append(f"❌ {key}: Missing")
+    
+    embed.add_field(name="Webhooks", value="\n".join(webhooks_status), inline=False)
+    
+    # Connection status
+    if manager.is_running:
+        embed.add_field(name="Status", value="🟢 **Connected & Logging**", inline=False)
+        embed.add_field(name="WebSocket", value=f"`{manager.current_websocket_uri}`", inline=False)
+    else:
+        embed.add_field(name="Status", value="🔴 **Stopped**", inline=False)
+        if manager.current_websocket_uri:
+            embed.add_field(name="Last WebSocket", value=f"`{manager.current_websocket_uri}`", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
 
 if __name__ == "__main__":
-    if not config.TOKEN:
+    TOKEN = os.getenv('DISCORD_TOKEN')
+    if not TOKEN:
         print("Error: DISCORD_TOKEN environment variable not set!")
+        print("Please set it using: export DISCORD_TOKEN='your_token_here'")
     else:
-        bot.run(config.TOKEN)
+        bot.run(TOKEN)
