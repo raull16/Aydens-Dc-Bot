@@ -6,6 +6,12 @@ import asyncio
 import json
 from typing import Dict, Optional
 import os
+import base64
+import hashlib
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+import re
 
 # Disable voice to avoid audioop issues
 discord.voice_client.VoiceClient = None
@@ -18,6 +24,102 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Store data for each guild
 guild_data: Dict[int, dict] = {}
+
+def detect_encryption(data: str) -> dict:
+    """Detect if data is encrypted and what type of encryption"""
+    result = {
+        'is_encrypted': False,
+        'encryption_type': None,
+        'decrypted_data': None
+    }
+    
+    # Check for base64 encoded data
+    base64_pattern = r'^[A-Za-z0-9+/]+=*$'
+    if re.match(base64_pattern, data.strip()) and len(data) > 20:
+        try:
+            decoded = base64.b64decode(data)
+            # Check if decoded data looks like JSON or text
+            try:
+                decoded_str = decoded.decode('utf-8')
+                result['is_encrypted'] = True
+                result['encryption_type'] = 'base64'
+                result['decrypted_data'] = decoded_str
+                return result
+            except:
+                pass
+        except:
+            pass
+    
+    # Check for hex encoded data
+    hex_pattern = r'^[0-9a-fA-F]+$'
+    if re.match(hex_pattern, data.strip()) and len(data) % 2 == 0 and len(data) > 20:
+        try:
+            decoded = bytes.fromhex(data).decode('utf-8', errors='ignore')
+            if decoded.isprintable():
+                result['is_encrypted'] = True
+                result['encryption_type'] = 'hex'
+                result['decrypted_data'] = decoded
+                return result
+        except:
+            pass
+    
+    # Check for Fernet encryption (starts with gAAAAA)
+    if data.startswith('gAAAAA'):
+        try:
+            # This is Fernet encrypted - we'd need the key
+            result['is_encrypted'] = True
+            result['encryption_type'] = 'fernet'
+            result['decrypted_data'] = "🔐 Fernet encrypted - requires decryption key"
+            return result
+        except:
+            pass
+    
+    # Check for common encryption patterns
+    encryption_indicators = [
+        ('AES', r'[^\x20-\x7E]{10,}'),  # Non-printable chars
+        ('Binary', r'[\x00-\x08\x0B\x0C\x0E-\x1F]{5,}')  # Control characters
+    ]
+    
+    for enc_type, pattern in encryption_indicators:
+        if re.search(pattern, data):
+            result['is_encrypted'] = True
+            result['encryption_type'] = enc_type
+            result['decrypted_data'] = f"🔒 {enc_type} encrypted data (cannot auto-decrypt without key)"
+            return result
+    
+    return result
+
+def try_decrypt_data(data: str, encryption_key: str = None) -> str:
+    """Attempt to decrypt various encryption types"""
+    detection = detect_encryption(data)
+    
+    if not detection['is_encrypted']:
+        return data
+    
+    if detection['encryption_type'] == 'base64':
+        try:
+            decoded = base64.b64decode(data).decode('utf-8', errors='ignore')
+            return f"🔓 **Decrypted (Base64):**\n```\n{decoded}\n```"
+        except:
+            return f"⚠️ **Base64 encoded but couldn't decode:**\n```\n{data}\n```"
+    
+    elif detection['encryption_type'] == 'hex':
+        try:
+            decoded = bytes.fromhex(data).decode('utf-8', errors='ignore')
+            return f"🔓 **Decrypted (Hex):**\n```\n{decoded}\n```"
+        except:
+            return f"⚠️ **Hex encoded but couldn't decode:**\n```\n{data}\n```"
+    
+    elif detection['encryption_type'] == 'fernet' and encryption_key:
+        try:
+            f = Fernet(encryption_key)
+            decrypted = f.decrypt(data.encode()).decode()
+            return f"🔓 **Decrypted (Fernet):**\n```\n{decrypted}\n```"
+        except:
+            return f"🔐 **Fernet encrypted (invalid key or corrupted):**\n```\n{data[:500]}\n```"
+    
+    else:
+        return f"🔒 **Encrypted Data Detected ({detection['encryption_type']}):**\n```\n{data[:500]}\n```\n*Auto-decryption not available without key*"
 
 class LogManager:
     def __init__(self, guild_id: int):
@@ -36,6 +138,7 @@ class LogManager:
         self.websocket_task = None
         self.is_running = False
         self.current_websocket_uri = None
+        self.encryption_key = None
 
     async def create_webhooks(self, guild: discord.Guild):
         """Create webhooks in all three channels"""
@@ -44,7 +147,6 @@ class LogManager:
                 channel = guild.get_channel(channel_id)
                 if channel:
                     try:
-                        # Check if webhook already exists
                         existing_webhooks = await channel.webhooks()
                         webhook = next((w for w in existing_webhooks if w.name == f"LogBot-{key}"), None)
                         if not webhook:
@@ -60,7 +162,6 @@ class LogManager:
         webhook = self.webhooks.get(key)
         if webhook:
             try:
-                # Truncate message if too long (Discord limit is 2000)
                 if len(message) > 1900:
                     message = message[:1900] + "..."
                 await webhook.send(message)
@@ -72,48 +173,116 @@ class LogManager:
         for key in self.webhooks:
             await self.send_log(key, message)
 
-    async def websocket_handler(self, uri: str):
-        """Handle WebSocket connection and receive logs"""
-        try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=60) as websocket:
-                self.websocket = websocket
-                await self.send_to_all(f"✅ Connected to WebSocket: `{uri}`")
+    async def websocket_handler(self, uri: str, headers: dict = None):
+        """Handle WebSocket connection and receive logs with improved error handling"""
+        retry_count = 0
+        max_retries = 3
+        
+        while retry_count < max_retries and self.is_running:
+            try:
+                # Add connection options
+                extra_headers = headers or {
+                    'User-Agent': 'Discord-LogBot/1.0',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'Upgrade',
+                    'Upgrade': 'websocket'
+                }
                 
-                while self.is_running:
+                async with websockets.connect(
+                    uri,
+                    extra_headers=extra_headers,
+                    ping_interval=20,
+                    ping_timeout=60,
+                    close_timeout=10,
+                    max_size=10_485_760  # 10MB max message size
+                ) as websocket:
+                    self.websocket = websocket
+                    await self.send_to_all(f"✅ Connected to WebSocket: `{uri}`")
+                    retry_count = 0  # Reset retry count on successful connection
+                    
+                    # Send initial subscription message if needed
+                    subscription_msg = {
+                        "type": "subscribe",
+                        "channel": "logs"
+                    }
                     try:
-                        message = await asyncio.wait_for(websocket.recv(), timeout=30)
-                        
-                        # Try to parse as JSON for better formatting
+                        await websocket.send(json.dumps(subscription_msg))
+                        await self.send_to_all("📡 Subscription request sent")
+                    except:
+                        pass
+                    
+                    while self.is_running:
                         try:
-                            data = json.loads(message)
-                            log_text = f"📝 **Log Received:**\n```json\n{json.dumps(data, indent=2)[:1500]}\n```"
-                        except:
-                            log_text = f"📝 **Log Received:**\n```\n{message[:1500]}\n```"
-                        
-                        await self.send_to_all(log_text)
-                    except asyncio.TimeoutError:
-                        # Keep connection alive
-                        continue
-                    except websockets.exceptions.ConnectionClosed as e:
-                        await self.send_to_all(f"⚠️ WebSocket connection closed: {e}")
-                        break
-                    except Exception as e:
-                        await self.send_to_all(f"❌ Error receiving log: {str(e)[:500]}")
-                        break
-        except Exception as e:
-            await self.send_to_all(f"❌ Failed to connect to WebSocket: {str(e)[:500]}")
-        finally:
-            self.is_running = False
-            self.websocket = None
+                            message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                            
+                            # Try to parse as JSON
+                            try:
+                                data = json.loads(message)
+                                # Check if it's an error message
+                                if isinstance(data, dict) and 'error' in data:
+                                    await self.send_to_all(f"⚠️ WebSocket Error: {data['error']}")
+                                    continue
+                                
+                                # Format JSON nicely
+                                json_str = json.dumps(data, indent=2)
+                                
+                                # Detect encryption in JSON values
+                                if isinstance(data, dict):
+                                    for key, value in data.items():
+                                        if isinstance(value, str) and len(value) > 20:
+                                            encrypted_check = detect_encryption(value)
+                                            if encrypted_check['is_encrypted']:
+                                                data[key] = f"[ENCRYPTED: {encrypted_check['encryption_type']}]"
+                                
+                                log_text = f"📝 **Log Received:**\n```json\n{json_str[:1500]}\n```"
+                            except json.JSONDecodeError:
+                                # Not JSON, check for encryption
+                                decrypted_message = try_decrypt_data(message, self.encryption_key)
+                                log_text = decrypted_message
+                            
+                            await self.send_to_all(log_text)
+                            
+                        except asyncio.TimeoutError:
+                            # Send heartbeat/ping to keep connection alive
+                            try:
+                                await websocket.ping()
+                            except:
+                                pass
+                            continue
+                        except websockets.exceptions.ConnectionClosed as e:
+                            await self.send_to_all(f"⚠️ WebSocket connection closed: {e}")
+                            break
+                        except Exception as e:
+                            await self.send_to_all(f"❌ Error receiving log: {str(e)[:500]}")
+                            continue
+                            
+            except websockets.exceptions.InvalidURI as e:
+                await self.send_to_all(f"❌ Invalid WebSocket URI: {e}")
+                break
+            except websockets.exceptions.WebSocketException as e:
+                retry_count += 1
+                if retry_count < max_retries:
+                    wait_time = retry_count * 5
+                    await self.send_to_all(f"⚠️ Connection error: {e}\nRetrying in {wait_time} seconds... (Attempt {retry_count}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                else:
+                    await self.send_to_all(f"❌ Failed to connect after {max_retries} attempts: {e}")
+                    break
+            except Exception as e:
+                await self.send_to_all(f"❌ Unexpected error: {str(e)[:500]}")
+                break
+        
+        self.is_running = False
+        self.websocket = None
 
-    async def start_logging(self, uri: str):
+    async def start_logging(self, uri: str, headers: dict = None):
         """Start the logging process"""
         if self.is_running:
             return False
         
         self.current_websocket_uri = uri
         self.is_running = True
-        self.websocket_task = asyncio.create_task(self.websocket_handler(uri))
+        self.websocket_task = asyncio.create_task(self.websocket_handler(uri, headers))
         return True
 
     async def stop_logging(self):
@@ -149,7 +318,6 @@ async def on_ready():
     ch3="Third channel for logs"
 )
 async def setchannel(interaction: discord.Interaction, ch1: discord.TextChannel, ch2: discord.TextChannel, ch3: discord.TextChannel):
-    # Check permissions
     if not interaction.guild:
         await interaction.response.send_message("This command must be used in a server!", ephemeral=True)
         return
@@ -158,23 +326,19 @@ async def setchannel(interaction: discord.Interaction, ch1: discord.TextChannel,
         await interaction.response.send_message("You need administrator permissions!", ephemeral=True)
         return
     
-    # Initialize guild data if not exists
     if interaction.guild_id not in guild_data:
         guild_data[interaction.guild_id] = LogManager(interaction.guild_id)
     
     manager = guild_data[interaction.guild_id]
     
-    # Store channel IDs
     manager.channels = {
         'ch1': ch1.id,
         'ch2': ch2.id,
         'ch3': ch3.id
     }
     
-    # Create webhooks
     await manager.create_webhooks(interaction.guild)
     
-    # Send confirmation
     channel_names = f"1. {ch1.mention}\n2. {ch2.mention}\n3. {ch3.mention}"
     embed = discord.Embed(
         title="✅ Channels Configured",
@@ -184,8 +348,17 @@ async def setchannel(interaction: discord.Interaction, ch1: discord.TextChannel,
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="connect", description="Connect to a WebSocket and start receiving logs")
-@app_commands.describe(websocket="The WebSocket URL to connect to (ws:// or wss://)")
-async def connect(interaction: discord.Interaction, websocket: str):
+@app_commands.describe(
+    websocket="The WebSocket URL to connect to (ws:// or wss://)",
+    auth_token="Optional: Authentication token for the WebSocket",
+    subscription="Optional: Subscription ID or channel name"
+)
+async def connect(
+    interaction: discord.Interaction, 
+    websocket: str, 
+    auth_token: str = None,
+    subscription: str = None
+):
     if not interaction.guild:
         await interaction.response.send_message("This command must be used in a server!", ephemeral=True)
         return
@@ -200,14 +373,22 @@ async def connect(interaction: discord.Interaction, websocket: str):
     
     manager = guild_data[interaction.guild_id]
     
-    # Check if webhooks exist
     if not any(manager.webhooks.values()):
         await interaction.response.send_message("Webhooks not found. Please reconfigure channels with `/setchannel`!", ephemeral=True)
         return
     
+    # Prepare headers for authentication
+    headers = {}
+    if auth_token:
+        headers['Authorization'] = f'Bearer {auth_token}'
+        headers['X-Auth-Token'] = auth_token
+    
+    if subscription:
+        headers['X-Subscription-ID'] = subscription
+    
     await interaction.response.send_message(f"🔄 Connecting to WebSocket: `{websocket}`...", ephemeral=True)
     
-    success = await manager.start_logging(websocket)
+    success = await manager.start_logging(websocket, headers if headers else None)
     if success:
         await interaction.followup.send(f"✅ Started logging from WebSocket: `{websocket}`")
     else:
@@ -282,7 +463,6 @@ async def status(interaction: discord.Interaction):
     
     embed = discord.Embed(title="📊 Logging Status", color=discord.Color.blue())
     
-    # Check channels
     channels_configured = []
     for key, channel_id in manager.channels.items():
         if channel_id:
@@ -296,7 +476,6 @@ async def status(interaction: discord.Interaction):
     
     embed.add_field(name="Channels", value="\n".join(channels_configured), inline=False)
     
-    # Check webhooks
     webhooks_status = []
     for key, webhook in manager.webhooks.items():
         if webhook:
@@ -306,7 +485,6 @@ async def status(interaction: discord.Interaction):
     
     embed.add_field(name="Webhooks", value="\n".join(webhooks_status), inline=False)
     
-    # Connection status
     if manager.is_running:
         embed.add_field(name="Status", value="🟢 **Connected & Logging**", inline=False)
         embed.add_field(name="WebSocket", value=f"`{manager.current_websocket_uri}`", inline=False)
@@ -317,10 +495,29 @@ async def status(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
-if __name__ == "__main__":
-    TOKEN = os.getenv('DISCORD_TOKEN')
-    if not TOKEN:
-        print("Error: DISCORD_TOKEN environment variable not set!")
-        print("Please set it using: export DISCORD_TOKEN='your_token_here'")
-    else:
-        bot.run(TOKEN)
+@bot.tree.command(name="setkey", description="Set encryption key for decrypting logs (Fernet keys only)")
+@app_commands.describe(encryption_key="The Fernet encryption key (starts with gAAAAA)")
+async def setkey(interaction: discord.Interaction, encryption_key: str):
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used in a server!", ephemeral=True)
+        return
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You need administrator permissions!", ephemeral=True)
+        return
+    
+    if interaction.guild_id not in guild_data:
+        guild_data[interaction.guild_id] = LogManager(interaction.guild_id)
+    
+    manager = guild_data[interaction.guild_id]
+    manager.encryption_key = encryption_key
+    
+    embed = discord.Embed(
+        title="🔑 Encryption Key Set",
+        description="The bot will now attempt to decrypt Fernet-encrypted logs using this key.",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# Add new dependencies
+# Update requirements.txt with: cryptography==41.0.7
